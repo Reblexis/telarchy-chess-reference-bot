@@ -27,6 +27,18 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 No account, no key, no credits. It reads the live feed and, when TelarchyBot
 is to move, says what it would trade. When the game is between moves it waits.
 
+On game 2, move 8 (every one of the 30 options priced 0.1, White already
+worse after the market's random moves), it said:
+
+```
+game 2 move 8: Stockfish likes e3 at 25.7, 30 moves rated, 30s to decide
+  e3 (e2e3): Stockfish 25.7, price 0.1 -> would buy higher 12.8 cr (dry run, no key)
+  Nc3 (b1c3): Stockfish 11.2, price 0.1 -> would buy higher 5.53 cr (dry run, no key)
+  h3 (h2h3): Stockfish 10.9, price 0.1 -> would buy higher 5.42 cr (dry run, no key)
+```
+
+The market played Kd1, which Stockfish scores at 0.
+
 Without Stockfish it stops and says so. It never falls back to guessing.
 
 ## Then with a key
