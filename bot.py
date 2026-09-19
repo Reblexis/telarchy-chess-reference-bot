@@ -1,12 +1,16 @@
 """A trading bot for futarchy chess on Telarchy, in one file.
 
 TelarchyBot plays chess on Lichess, and every one of its moves is a Telarchy
-proposal: one option per legal move, each option its own market on the game's
-score (100 a win, 50 a draw, 0 a loss). Two seconds before the deadline the
-option priced highest is played. A price is the market's guess at the score if
-that move is played, so a chess engine that disagrees with a price has an edge.
+proposal: one option per legal move, each option its own market on the
+player's Lichess classical rating at a half-hour mark 30 to 60 minutes on
+(range 1200 to 2000). Two seconds before the deadline the option priced highest
+is played. A price is the market's guess at the rating if that move is played.
+A chess engine knows what a move does to this game, a game is worth about 16
+rating points between a loss and a win, so an engine that disagrees with a
+price has an edge.
 
-    read the feed  ->  ask Stockfish about every legal move  ->  trade the gaps
+    read the feed  ->  ask Stockfish about every legal move
+                   ->  turn each score into a rating  ->  trade the gaps
 
 That is the whole loop. Start here, replace `plan()` with your own opinion,
 keep the rest.
@@ -48,14 +52,18 @@ STOCKFISH_FALLBACKS = ["/usr/games/stockfish"]
 # costs the spread.
 MIN_SECONDS = 3.0
 
+# Rating points between losing and winning one rated game against an opponent
+# of about the same rating: 8 up for a win, 8 down for a loss, 0 for a draw.
+GAME_SWING = 16.0
+
 
 @dataclass
 class Config:
     feed: str = FEED_DEFAULT
     stockfish: str = "stockfish"
     think: float = 1.0        # seconds Stockfish gets per position
-    margin: float = 5.0       # score points a price must be off before trading
-    stake: float = 5.0        # credits per 10 points of gap
+    margin: float = 0.5       # rating points a price must be off the forecast before trading
+    stake: float = 5.0        # credits per 1.6 rating points of gap (10 points of game score)
     max_stake: float = 20.0   # never more than this on one option
     max_trades: int = 3       # never more than this many options per proposal
     buy_lower: bool = True    # also bet against an overpriced leading move
@@ -84,8 +92,9 @@ class Trade:
     market_id: str
     direction: str   # "higher" or "lower"
     amount: float    # credits
-    expected: float  # what the engine thinks the score is, 0..100
-    price: float     # what the market thinks it is
+    expected: float  # the rating forecast if this move is played
+    price: float     # what the market thinks that rating is
+    score: float | None = None  # the engine's game score behind it, 0..100
 
 
 # ------------------------------------------------ an engine opinion as a score
@@ -139,25 +148,76 @@ def evaluate(engine, fen: str, color: chess.Color, think: float) -> dict[str, fl
     return out
 
 
+# ------------------------------------------------- a game score as a rating
+
+
+def _number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def anchor(state: dict) -> float | None:
+    """The rating every forecast starts from.
+
+    `player.rating` from the feed; without a numeric one, the main book's
+    price (`call.value`); without either, None, and the bot does not trade.
+    """
+    for block, key in (("player", "rating"), ("call", "value")):
+        b = state.get(block)
+        if isinstance(b, dict) and _number(b.get(key)):
+            return float(b[key])
+    return None
+
+
+def forecast(expected: float, rating: float) -> float:
+    """The rating at the mark if a move with game score `expected` is played.
+
+    forecast = rating + GAME_SWING * (E / 100 - 0.5). The games played after
+    this one before the mark add noise to every option alike, so they are
+    left out.
+    """
+    return rating + GAME_SWING * (expected / 100.0 - 0.5)
+
+
+def forecasts(evals: dict[str, float], rating: float) -> dict[str, float]:
+    return {uci: forecast(e, rating) for uci, e in evals.items()}
+
+
+def limit_for(value: float, trade: dict) -> float | None:
+    """A limit price strictly inside the market's range, as the feed gives it.
+
+    Clamped to rangeMin + 1 .. rangeMax - 1. None when the feed has no usable
+    range: a limit that might sit outside the book is not sent.
+    """
+    lo, hi = trade.get("rangeMin"), trade.get("rangeMax")
+    if not (_number(lo) and _number(hi)) or lo + 1 > hi - 1:
+        return None
+    return max(lo + 1, min(hi - 1, round(value, 2)))
+
+
 # ---------------------------------------------------------------- the opinion
 
 
 def stake_for(gap: float, cfg: Config) -> float:
-    """Credits for a gap: `stake` per 10 points, capped at `max_stake`.
+    """Credits for a gap in rating points, capped at `max_stake`.
 
-    Small on purpose. An option book holds 100 credits, and on a thin book the
+    `stake` per tenth of a game's swing (1.6 rating points, which is 10 points
+    of game score). Small on purpose. An option book holds 100 credits, and on a thin book the
     price you pay is the average across the move you make.
     """
-    return round(min(cfg.max_stake, cfg.stake * gap / 10.0), 2)
+    return round(min(cfg.max_stake, cfg.stake * gap / (GAME_SWING / 10.0)), 2)
 
 
-def plan(open_: dict, evals: dict[str, float], traded: set[str], cfg: Config) -> list[Trade]:
+def plan(open_: dict, evals: dict[str, float], traded: set[str], cfg: Config,
+         scores: dict[str, float] | None = None) -> list[Trade]:
     """Which options to trade now, in order.
 
+    `evals` are rating forecasts keyed by UCI (see `forecast()`), in the same
+    unit as the prices; `scores` are the game scores behind them, for the log.
+
     THE STRATEGY, and it is the simplest defensible one: Stockfish is a better
-    chess player than an empty book, so where its score for a move is more than
-    `margin` above the price, buy higher; where the move that would be played
-    right now is priced more than `margin` above Stockfish's score, buy lower.
+    chess player than an empty book, so where its forecast for a move is more
+    than `margin` above the price, buy higher; where the move that would be
+    played right now is priced more than `margin` above its forecast, buy lower.
 
     Lower first (it is the trade that stops a bad move being played), then
     higher from Stockfish's favourite down, at most `max_trades` options per
@@ -190,6 +250,7 @@ def plan(open_: dict, evals: dict[str, float], traded: set[str], cfg: Config) ->
             option=o["id"], san=o.get("san") or o["id"], market_id=o["marketId"],
             direction=direction, amount=stake_for(gap, cfg),
             expected=evals[o["id"]], price=float(o["price"]),
+            score=(scores or {}).get(o["id"]),
         )
 
     lower = []
@@ -248,7 +309,7 @@ def parse_time(value) -> datetime | None:
 
 
 def _n(x) -> str:
-    return f"{x:.4g}" if isinstance(x, (int, float)) and not isinstance(x, bool) else "?"
+    return f"{x:.6g}" if isinstance(x, (int, float)) and not isinstance(x, bool) else "?"
 
 
 # -------------------------------------------------------------------- the bot
@@ -270,6 +331,7 @@ class Bot:
         self.traded: set[str] = set()
         self.fen: str | None = None
         self.evals: dict[str, float] = {}
+        self.warned: tuple | None = None
 
     def seconds_left(self, open_: dict) -> float | None:
         at = parse_time(open_.get("decideAt"))
@@ -297,6 +359,18 @@ class Bot:
         if proposal != self.proposal:
             self.proposal, self.traded = proposal, set()
 
+        rating = anchor(state)
+        why = None
+        if rating is None:
+            why = "no rating on the feed (neither player.rating nor call.value)"
+        elif limit_for(rating, trade) is None:
+            why = "no range on the feed (trade.rangeMin, trade.rangeMax)"
+        if why:
+            if self.warned != (proposal, why):
+                self.warned = (proposal, why)
+                self.out(f"game {game.get('number')} move {open_.get('move')}: not trading, {why}")
+            return
+
         if fen != self.fen:
             side = chess.WHITE if color == "white" else chess.BLACK
             self.evals = evaluate(self.engine, fen, side, self.cfg.think)
@@ -305,8 +379,9 @@ class Bot:
             if self.evals:
                 best = max(self.evals, key=self.evals.get)
                 self.out(
-                    f"game {game.get('number')} move {open_.get('move')}: "
-                    f"Stockfish likes {sans.get(best) or best} at {self.evals[best]:.1f}, "
+                    f"game {game.get('number')} move {open_.get('move')}: rating {rating:g}, "
+                    f"Stockfish likes {sans.get(best) or best} at {self.evals[best]:.1f} "
+                    f"(rating {forecast(self.evals[best], rating):.1f}), "
                     f"{len(self.evals)} moves rated, {left:.0f}s to decide"
                 )
 
@@ -315,12 +390,13 @@ class Bot:
         if left is None or left <= MIN_SECONDS:
             return
 
-        for t in plan(open_, self.evals, self.traded, self.cfg):
+        for t in plan(open_, forecasts(self.evals, rating), self.traded, self.cfg, self.evals):
             self.traded.add(t.option)  # an attempt counts: never the same option twice
             self.out(self.place(t, proposal, trade))
 
     def place(self, t: Trade, proposal: str, trade: dict) -> str:
-        where = f"  {t.san} ({t.option}): Stockfish {t.expected:.1f}, price {_n(t.price)}"
+        engine = f"Stockfish {t.score:.1f}, " if t.score is not None else ""
+        where = f"  {t.san} ({t.option}): {engine}rating {t.expected:.1f}, price {_n(t.price)}"
         what = f"buy {t.direction} {t.amount:g} cr"
         if not self.key:
             return f"{where} -> would {what} (dry run, no key)"
@@ -340,7 +416,8 @@ class Bot:
             "amount": t.amount,
             # Never push the price past what the engine thinks: the trade
             # fills only as far as this and keeps the rest of the credits.
-            "limit": round(t.expected, 2),
+            # Strictly inside the feed's range.
+            "limit": limit_for(t.expected, trade),
         }
         if not self.live:
             body["dryRun"] = True  # a quote: same transaction, rolled back
@@ -403,7 +480,7 @@ def main(argv: list[str] | None = None, env=None) -> int:
 
     mode = "trading" if args.live else ("dry run with quotes" if key else "dry run")
     print(f"{mode}: {cfg.feed}, {path}, think {cfg.think:g}s, margin {cfg.margin:g}, "
-          f"stake {cfg.stake:g}/10 points up to {cfg.max_stake:g}, {cfg.max_trades} options per move", flush=True)
+          f"stake {cfg.stake:g}/1.6 rating points up to {cfg.max_stake:g}, {cfg.max_trades} options per move", flush=True)
 
     bot = Bot(cfg, engine, key=key, live=args.live)
     last_phase = None

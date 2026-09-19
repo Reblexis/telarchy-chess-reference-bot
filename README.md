@@ -5,13 +5,14 @@ readable file.
 
 TelarchyBot plays chess on Lichess, and a market picks every move. On each of
 its turns one Telarchy proposal goes up with one option per legal move. Each
-option has its own market on the game's score: 100 a win, 50 a draw, 0 a loss.
-Two seconds before the deadline the option priced highest is played, and the
+option has its own market on the player's Lichess classical rating at a
+half-hour mark 30 to 60 minutes on (market range 1200 to 2000; the feed names
+the mark as `cell`). Two seconds before the deadline the option priced highest is played, and the
 rest are voided and refunded. With nobody trading, every option has the same
 price and the move is random. This bot asks Stockfish instead.
 
 ```
-read the feed  ->  ask Stockfish about every legal move  ->  trade the gaps
+read the feed  ->  ask Stockfish about every legal move  ->  turn each score into a rating  ->  trade the gaps
 ```
 
 That is the whole loop. [`bot.py`](bot.py) is one file, mostly comments.
@@ -27,17 +28,14 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 No account, no key, no credits. It reads the live feed and, when TelarchyBot
 is to move, says what it would trade. When the game is between moves it waits.
 
-On game 2, move 8 (every one of the 30 options priced 0.1, White already
-worse after the market's random moves), it said:
+With the player rated 1500 and every option priced 1500, a position where
+Stockfish gives e4 a game score of 62 and a3 a score of 38 reads:
 
 ```
-game 2 move 8: Stockfish likes e3 at 25.7, 30 moves rated, 30s to decide
-  e3 (e2e3): Stockfish 25.7, price 0.1 -> would buy higher 12.8 cr (dry run, no key)
-  Nc3 (b1c3): Stockfish 11.2, price 0.1 -> would buy higher 5.53 cr (dry run, no key)
-  h3 (h2h3): Stockfish 10.9, price 0.1 -> would buy higher 5.42 cr (dry run, no key)
+game 2 move 8: rating 1500, Stockfish likes e4 at 62.0 (rating 1501.9), 20 moves rated, 30s to decide
+  a3 (a2a3): Stockfish 38.0, rating 1498.1, price 1500 -> would buy lower 6 cr (dry run, no key)
+  e4 (e2e4): Stockfish 62.0, rating 1501.9, price 1500 -> would buy higher 6 cr (dry run, no key)
 ```
-
-The market played Kd1, which Stockfish scores at 0.
 
 Without Stockfish it stops and says so. It never falls back to guessing.
 
@@ -65,19 +63,36 @@ works either way.
 
 For each legal move Stockfish gives a win, draw and loss estimate (or a
 centipawn score, turned into one with the logistic Lichess uses). A mate is
-100 or 0. That becomes an expected score from TelarchyBot's side.
+100 or 0. That becomes an expected game score E from TelarchyBot's side,
+0 a loss, 50 a draw, 100 a win.
+
+The books are priced in rating points, so the score becomes a rating forecast:
+
+```
+forecast = rating + 16 * (E / 100 - 0.5)
+```
+
+A rated game against an equal opponent is worth about 8 points up for a win,
+8 down for a loss and nothing for a draw, so 16 (`GAME_SWING`) is the swing
+between a loss and a win. The games played after this one before the mark add
+noise to every option alike and are ignored. `rating` is `player.rating` from
+the feed; when the feed has no numeric `player.rating` it is `call.value` (the
+main book's price); when it has neither, the bot does not trade that read and
+says why.
 
 Then, per proposal:
 
-- where Stockfish's score for a move is more than 5 points above its price,
-  buy higher;
-- where the move that would be played right now is priced more than 5 points
-  above Stockfish's score, buy lower;
-- 5 credits per 10 points of gap, at most 20 on one option, at most 3 options
-  per proposal, never the same option twice, never with 3 seconds or less to
-  go;
-- every trade carries `limit` at Stockfish's score, so it never pushes the
-  price past its own opinion.
+- where the forecast for a move is more than 0.5 rating points above its
+  price, buy higher;
+- where the move that would be played right now is priced more than 0.5
+  rating points above its forecast, buy lower;
+- 5 credits per 1.6 rating points of gap (a tenth of a game's swing, which is
+  10 points of game score), at most 20 on one option, at most 3 options per
+  proposal, never the same option twice, never with 3 seconds or less to go;
+- every trade carries `limit` at the forecast, so it never pushes the price
+  past its own opinion. The limit always sits strictly inside the market's
+  range as the feed gives it: clamped to `trade.rangeMin + 1` ..
+  `trade.rangeMax - 1`. A feed without a numeric range is not traded.
 
 Be honest about what that ignores:
 
@@ -85,10 +100,12 @@ Be honest about what that ignores:
   if both sides then play well. Every later move is picked by a market too, so
   when the market plays badly the real expected score is lower than
   Stockfish's.
-- The opponent's strength and both clocks.
+- The opponent's strength and both clocks. The 16 point swing assumes an
+  opponent of equal rating, and a provisional rating moves far more.
+- Every game played between this one and the mark.
 - That lifting the second best move can make it the one that gets played.
-- How deep the book is (100 credits per option), and that the chosen move's
-  stake stays out until the game ends.
+- How deep the book is, and that the chosen move's stake stays out until its
+  mark settles.
 - One second of thinking is not much. Stockfish on a slow machine at one
   second is a strong club player, not a perfect one.
 
@@ -102,8 +119,8 @@ All by environment, all optional:
 - `CHESS_FEED`: the feed, default `https://chess.167-233-147-90.nip.io/state`
 - `STOCKFISH`: the engine, default `stockfish` on PATH (then `/usr/games/stockfish`)
 - `THINK_SECONDS`: think time per position, default `1.0`
-- `MARGIN`: score points a price must be off before trading, default `5`
-- `STAKE`: credits per 10 points of gap, default `5`
+- `MARGIN`: rating points a price must be off the forecast before trading, default `0.5`
+- `STAKE`: credits per 1.6 rating points of gap, default `5`
 - `MAX_STAKE`: most credits on one option, default `20`
 - `MAX_TRADES`: most options traded per proposal, default `3`
 - `BUY_LOWER`: `0` to never bet against the leading move, default on
@@ -121,7 +138,13 @@ All by environment, all optional:
 - `open`: `proposal.id`, `decideAt`, `tradeable`, and `options`, each with
   `id` (the move in UCI), `san`, `price` and `marketId`; a missing price is
   `null`
-- `trade`: `base` and `workspaceId`
+- `player`: `rating`, the current classical rating, the anchor of every
+  forecast
+- `call`: `value`, the main book's price, the anchor when `player.rating` is
+  missing
+- `cell`: the half-hour mark the books are priced on, e.g. `2026-09-19T13:00`
+- `trade`: `base`, `workspaceId`, and `rangeMin` / `rangeMax` (1200 / 2000),
+  the range every limit must sit strictly inside
 
 A trade is `POST {base}/predictions/trade` with `X-Agent-Key` and
 `X-Workspace-Id`, body `{ marketId, direction, amount, limit }`.
@@ -134,8 +157,8 @@ A trade is `POST {base}/predictions/trade` with `X-Agent-Key` and
 
 No network and no Stockfish: the engine is a fake and the HTTP goes to a
 recording function or a local stub server. What is tested is what costs money
-when it is wrong: how an engine score becomes a Game score, which options get
-traded, that none is traded twice, that nothing trades too close to the
+when it is wrong: how an engine score becomes a game score and then a rating
+forecast, which options get traded, that a limit stays inside the range, that none is traded twice, that nothing trades too close to the
 decision, and that a dry run places nothing.
 
 ## Licence
